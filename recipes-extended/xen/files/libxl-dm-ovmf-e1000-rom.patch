@@ -1,0 +1,27 @@
+diff --git a/tools/libxl/libxl_dm.c b/tools/libxl/libxl_dm.c
+index e3796cf..2006fa1 100644
+--- a/tools/libxl/libxl_dm.c
++++ b/tools/libxl/libxl_dm.c
+@@ -1257,12 +1257,20 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
+                                                 LIBXL_NIC_TYPE_VIF_IOEMU);
+                 flexarray_append(dm_args, "-device");
+                 flexarray_append(dm_args,
+-                   GCSPRINTF("%s,id=%s%d,netdev=net%d,mac=%s",
++                   GCSPRINTF("%s,id=%s%d,netdev=net%d,mac=%s%s",
+                              nics[i].model,
+                              (libxl_defbool_val(nics[i].wireless)) ? "vwif" : "vif",
+                              nics[i].devid,
+                              nics[i].devid,
+-                             smac));
++                             smac,
++                             /*
++                              * The elements of the flexarray are combined into a single string
++                              * with a space between each element.
++                              * So we can't do
++                              * if (BIOS is OVMF) flexarray_append(...)
++                              * to get the romfile option into the dm_args
++                              */
++                             (b_info->u.hvm.bios == LIBXL_BIOS_TYPE_OVMF) ? ",romfile=/usr/share/firmware/efi-e1000.rom" : ""));
+                 flexarray_append(dm_args, "-netdev");
+                 flexarray_append(dm_args,
+                                  GCSPRINTF("type=tap,id=net%d,ifname=%s,"
