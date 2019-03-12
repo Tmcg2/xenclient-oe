@@ -1,27 +1,117 @@
 diff --git a/tools/libxl/libxl_dm.c b/tools/libxl/libxl_dm.c
-index e3796cf..2006fa1 100644
+index e3796cf..21ad462 100644
 --- a/tools/libxl/libxl_dm.c
 +++ b/tools/libxl/libxl_dm.c
-@@ -1257,12 +1257,20 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
-                                                 LIBXL_NIC_TYPE_VIF_IOEMU);
-                 flexarray_append(dm_args, "-device");
-                 flexarray_append(dm_args,
--                   GCSPRINTF("%s,id=%s%d,netdev=net%d,mac=%s",
-+                   GCSPRINTF("%s,id=%s%d,netdev=net%d,mac=%s%s",
-                              nics[i].model,
-                              (libxl_defbool_val(nics[i].wireless)) ? "vwif" : "vif",
-                              nics[i].devid,
-                              nics[i].devid,
--                             smac));
-+                             smac,
-+                             /*
-+                              * The elements of the flexarray are combined into a single string
-+                              * with a space between each element.
-+                              * So we can't do
-+                              * if (BIOS is OVMF) flexarray_append(...)
-+                              * to get the romfile option into the dm_args
-+                              */
-+                             (b_info->u.hvm.bios == LIBXL_BIOS_TYPE_OVMF) ? ",romfile=/usr/share/firmware/efi-e1000.rom" : ""));
-                 flexarray_append(dm_args, "-netdev");
-                 flexarray_append(dm_args,
-                                  GCSPRINTF("type=tap,id=net%d,ifname=%s,"
+@@ -922,6 +922,78 @@ static char *qemu_disk_ide_drive_string(libxl__gc *gc, const char *target_path,
+     return drive;
+ }
+ 
++static char *qemu_disk_ide_drive_device_string(libxl__gc *gc, const char *target_path,
++                                        int unit, const char *format,
++                                        const libxl_device_disk *disk,
++                                        int colo_mode)
++{
++    char *drive = NULL;
++    const char *exportname = disk->colo_export;
++    const char *active_disk = disk->active_disk;
++    const char *hidden_disk = disk->hidden_disk;
++    const char *access = disk->readwrite ? "cache=writeback" : "readonly";
++    const uint32_t domid = disk->backend_domid;
++    const char *disk_id = GCSPRINTF("hd-%d-%d", domid, unit);
++
++    switch (colo_mode) {
++    case LIBXL__COLO_NONE:
++        /*
++         * Give the drive a unique ID:
++         * hd-<DOMID>-<DISK#>
++         */
++        drive = GCSPRINTF
++            ("file=%s,if=none,id=%s,index=%d,media=disk,format=%s,%s -device ide-hd,drive=%s,bootindex=%d",
++             target_path, disk_id, unit, format, access, disk_id, unit);
++        break;
++    case LIBXL__COLO_PRIMARY:
++        /*
++         * primary:
++         *  -dirve if=ide,index=x,media=disk,cache=writeback,driver=quorum,\
++         *  id=exportname,\
++         *  children.0.file.filename=target_path,\
++         *  children.0.driver=format,\
++         *  read-pattern=fifo,\
++         *  vote-threshold=1
++         */
++        drive = GCSPRINTF(
++            "if=ide,index=%d,media=disk,%s,driver=quorum,"
++            "id=%s,"
++            "children.0.file.filename=%s,"
++            "children.0.driver=%s,"
++            "read-pattern=fifo,"
++            "vote-threshold=1",
++             unit, access, exportname, target_path, format);
++        break;
++    case LIBXL__COLO_SECONDARY:
++        /*
++         * secondary:
++         *  -drive if=ide,index=x,media=disk,cache=writeback,driver=replication,\
++         *  mode=secondary,\
++         *  file.driver=qcow2,\
++         *  file.file.filename=active_disk,\
++         *  file.backing.driver=qcow2,\
++         *  file.backing.file.filename=hidden_disk,\
++         *  file.backing.backing=exportname,
++         */
++        drive = GCSPRINTF(
++            "if=ide,index=%d,id=top-colo,media=disk,%s,"
++            "driver=replication,"
++            "mode=secondary,"
++            "top-id=top-colo,"
++            "file.driver=qcow2,"
++            "file.file.filename=%s,"
++            "file.backing.driver=qcow2,"
++            "file.backing.file.filename=%s,"
++            "file.backing.backing=%s",
++            unit, access, active_disk, hidden_disk, exportname);
++        break;
++    default:
++         abort();
++    }
++
++    return drive;
++}
++
+ static int libxl__build_device_model_args_new(libxl__gc *gc,
+                                         const char *dm, int guest_domid,
+                                         const libxl_domain_config *guest_config,
+@@ -1159,7 +1231,17 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
+             return ERROR_INVAL;
+         }
+ 
+-        if (b_info->u.hvm.boot) {
++        /*
++         * If posts on the Arch forum are to be believed, -boot order=...
++         * is ignored if you're using OVMF, so only use if it bios type is
++         * NOT OVMF
++         * https://bbs.archlinux.org/viewtopic.php?id=212268
++         *
++         * This is a useful resource concerning this as well
++         * https://github.com/qemu/qemu/blob/master/docs/bootindex.txt
++         */
++        if (b_info->u.hvm.boot &&
++            b_info->u.hvm.bios != LIBXL_BIOS_TYPE_OVMF) {
+             flexarray_vappend(dm_args, "-boot",
+                     GCSPRINTF("order=%s", b_info->u.hvm.boot), NULL);
+         }
+@@ -1635,7 +1717,13 @@ static int libxl__build_device_model_args_new(libxl__gc *gc,
+                         flexarray_append(dm_args, "-drive");
+                         flexarray_append(dm_args, drive);
+                     }
+-                    drive = qemu_disk_ide_drive_string(gc, target_path, disk,
++                    if (b_info->u.hvm.bios != LIBXL_BIOS_TYPE_OVMF)
++                        drive = qemu_disk_ide_drive_string(gc, target_path, disk,
++                                                       format,
++                                                       &disks[i],
++                                                       colo_mode);
++                    else
++                        drive = qemu_disk_ide_drive_device_string(gc, target_path, disk,
+                                                        format,
+                                                        &disks[i],
+                                                        colo_mode);
